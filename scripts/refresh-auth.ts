@@ -159,6 +159,18 @@ async function main(): Promise<void> {
   }
   for (const m of tokenMatches.slice(0, 15)) {
     console.log(`[diag] candidate key="${m[1]}" valueLength=${m[2].length} prefix="${m[2].slice(0, 6)}..."`);
+    // Context before the match only -- shows the surrounding variable/key
+    // name and syntax without repeating the value itself.
+    const idx = m.index ?? 0;
+    console.log(`[diag]   context before: ...${dashHtml.slice(Math.max(0, idx - 70), idx)}`);
+  }
+  const apiTokenMentionIdx = dashHtml.search(/x-api-token/i);
+  if (apiTokenMentionIdx === -1) {
+    console.log('[diag] literal "X-Api-Token" string not found in /emp/ body');
+  } else {
+    console.log(
+      `[diag] "X-Api-Token" mentioned: ...${dashHtml.slice(Math.max(0, apiTokenMentionIdx - 80), apiTokenMentionIdx + 100)}...`,
+    );
   }
 
   // Razor Pages login handlers can either redirect (302) or re-render the
