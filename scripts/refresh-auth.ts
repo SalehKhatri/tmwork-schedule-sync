@@ -20,11 +20,15 @@
  * Local run: npm run refresh-auth
  * CI run: triggered automatically by the refresh-auth job in
  * .github/workflows/sync.yml when the sync job exits with code 2
- * (AuthExpiredError) -- see src/sync.ts.
+ * (AuthExpiredError) -- see src/sync.ts. In CI, the fresh cookie is also
+ * written to $GITHUB_ENV so the workflow's very next step (an immediate
+ * retry of sync.ts) can use it without waiting for the GitHub secret we
+ * just pushed to become visible to a new job.
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -67,6 +71,19 @@ function mergeCookies(jar: Map<string, string>, setCookieHeaders: string[]): voi
 
 function cookieHeader(jar: Map<string, string>): string {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+/**
+ * Exposes the fresh cookie to later steps in the same CI job, via
+ * $GITHUB_ENV, so an immediate retry of sync.ts doesn't have to wait for
+ * the (now-stale) `secrets.TMWORK_COOKIE` to refresh on the next run.
+ * No-op outside of GitHub Actions (e.g. local `npm run refresh-auth`).
+ */
+function exposeToCiJobEnv(cookie: string): void {
+  if (!process.env.GITHUB_ENV) return;
+  console.log("::add-mask::" + cookie); // keep it out of any later log output too
+  const delimiter = `TMWORK_COOKIE_${randomUUID()}`;
+  appendFileSync(process.env.GITHUB_ENV, `TMWORK_COOKIE<<${delimiter}\n${cookie}\n${delimiter}\n`);
 }
 
 function getRepoSlug(): string {
@@ -139,6 +156,8 @@ async function main(): Promise<void> {
         "expired too -- grab a fresh one from dev tools (see README) and update that secret by hand.",
     );
   }
+
+  exposeToCiJobEnv(newCookie);
 
   console.log("Pushing the fresh cookie to the TMWORK_COOKIE GitHub secret...");
   const repo = getRepoSlug();

@@ -182,15 +182,19 @@ second job, `refresh-auth` (see `.github/workflows/sync.yml`), which:
 2. Validates the resulting cookie against the emplist API.
 3. Pushes it to the `TMWORK_COOKIE` secret via `gh secret set`, authenticated
    with `SECRETS_ADMIN_TOKEN`.
+4. Immediately retries `sync` in the same job run, using the fresh cookie
+   directly (not by re-reading the secret — GitHub resolves `secrets.*`
+   once at job start, so a just-updated secret wouldn't be visible yet to a
+   later step in that same job anyway). This closes the gap that would
+   otherwise leave the Gist stale for up to 4 hours waiting on the next
+   scheduled run — if refresh succeeds, the calendar is caught up within
+   the same run, not the next cron tick.
 
-The next scheduled `sync` run (within 4 hours) then picks up the fresh
-cookie automatically. There's no immediate retry built in — kept simple on
-purpose — so expect up to a ~4-hour gap in calendar updates around a
-refresh, not a hard failure. You still get an ntfy push for the original
-expiry, and a second one specifically if `refresh-auth` itself fails
-(wrong password, tmwork's login flow changed, `TMWORK_API_TOKEN` turned out
-not to be static after all, etc.) — that's your signal something needs a
-manual look.
+You still get an ntfy push for the original expiry, and a second one
+specifically if the refresh and/or the retry fails (wrong password,
+tmwork's login flow changed, `TMWORK_API_TOKEN` turned out not to be
+static after all, etc.) — that's your signal something needs a manual
+look.
 
 **Know what this trades away before you rely on it:** `SECRETS_ADMIN_TOKEN`
 can read/write every secret in this repo (there's no way to scope a PAT to
@@ -260,7 +264,8 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_T
   identity pushing the result.
 - `.github/workflows/sync.yml` — two jobs: `sync` runs every 4 hours plus
   on-demand via `workflow_dispatch`; `refresh-auth` runs only when `sync`
-  exits with code 2, and pushes a fresh `TMWORK_COOKIE` for the next
-  scheduled run to pick up.
+  exits with code 2, pushes a fresh `TMWORK_COOKIE`, and immediately
+  retries `sync` in the same job so the Gist doesn't sit stale until the
+  next scheduled run.
 - Event times are written as floating local time (no `TZID`), matching the
   timestamps tmwork returns as-is.
