@@ -10,10 +10,17 @@
  * grab a fresh one from dev tools once (see README) and update that secret
  * by hand.
  *
- * Credentials come from .env.local (gitignored, never committed) -- see
- * .env.local.example for the fields it needs.
+ * Credentials come from either .env.local (local runs -- gitignored, never
+ * committed, see .env.local.example) or repo secrets (CI runs). Pushing the
+ * refreshed secret requires a `gh`-authenticated identity with permission to
+ * write Actions secrets on this repo: locally that's your own `gh auth
+ * login` session; in CI it's the SECRETS_ADMIN_TOKEN secret passed in as
+ * GH_TOKEN (see .github/workflows/sync.yml and README).
  *
- * Run with: npm run refresh-auth
+ * Local run: npm run refresh-auth
+ * CI run: triggered automatically by the refresh-auth job in
+ * .github/workflows/sync.yml when the sync job exits with code 2
+ * (AuthExpiredError) -- see src/sync.ts.
  */
 
 import { execFileSync } from "node:child_process";
@@ -63,6 +70,10 @@ function cookieHeader(jar: Map<string, string>): string {
 }
 
 function getRepoSlug(): string {
+  // GitHub Actions sets this automatically; prefer it there over parsing
+  // the local git remote (which the checkout step configures differently).
+  if (process.env.GITHUB_REPOSITORY) return process.env.GITHUB_REPOSITORY;
+
   const url = execFileSync("git", ["remote", "get-url", "origin"], { cwd: REPO_ROOT }).toString().trim();
   const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+?)(\.git)?$/);
   if (!match) throw new Error(`Couldn't parse a GitHub repo slug from remote URL: ${url}`);

@@ -182,5 +182,8 @@ main().catch(async (err: unknown) => {
 
   console.error(message);
   await notify(message);
-  process.exit(1);
+  // Exit code 2 specifically means "auth expired" -- the refresh-auth job in
+  // the workflow checks for this exact code to decide whether to attempt an
+  // automated re-login. Any other failure exits 1 and is left alone.
+  process.exit(isAuthError ? 2 : 1);
 });

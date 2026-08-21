@@ -8,6 +8,8 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      auth_expired: ${{ steps.run_sync.outputs.auth_expired }}
     steps:
       - uses: actions/checkout@v4
 
@@ -17,10 +19,60 @@ jobs:
 
       - run: npm install
 
-      - run: npx tsx src/sync.ts
+      - name: Run sync
+        id: run_sync
+        run: |
+          set +e
+          npx tsx src/sync.ts
+          code=$?
+          set -e
+          # Exit code 2 == AuthExpiredError (see src/sync.ts) -- signal that
+          # specifically to the refresh-auth job below, distinct from any
+          # other kind of failure.
+          if [ "$code" -eq 2 ]; then
+            echo "auth_expired=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "auth_expired=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$code"
         env:
           TMWORK_COOKIE: ${{ secrets.TMWORK_COOKIE }}
           TMWORK_API_TOKEN: ${{ secrets.TMWORK_API_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+  # Only runs when `sync` failed specifically due to an expired session
+  # cookie. Logs into tmwork directly, pushes a fresh TMWORK_COOKIE secret,
+  # and lets the next scheduled `sync` run (within 4 hours) pick it up --
+  # no immediate retry, kept simple on purpose. See README "About auth
+  # expiring" for the tradeoffs of doing this in CI at all.
+  refresh-auth:
+    needs: sync
+    if: always() && needs.sync.outputs.auth_expired == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm install
+
+      - name: Refresh tmwork session cookie
+        run: npx tsx scripts/refresh-auth.ts
+        env:
+          TMWORK_CODE: ${{ secrets.TMWORK_CODE }}
+          TMWORK_USER: ${{ secrets.TMWORK_USER }}
+          TMWORK_PASSWORD: ${{ secrets.TMWORK_PASSWORD }}
+          TMWORK_API_TOKEN: ${{ secrets.TMWORK_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.SECRETS_ADMIN_TOKEN }}
+
+      - name: Notify on refresh failure
+        if: failure()
+        run: |
+          curl -d "tmwork-schedule-sync: automated cookie refresh failed. TMWORK_API_TOKEN may have expired too, or tmwork's login flow may have changed -- manual fix needed." \
+            "https://ntfy.sh/${NTFY_TOPIC}"
+        env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}

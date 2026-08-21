@@ -15,9 +15,11 @@ fails — most commonly expired auth — it sends you a push notification via
 
 tmwork's `emplist` endpoint requires two things from your logged-in
 browser session: a `Cookie` header and an `X-Api-Token` header. Both are
-captured from dev tools together (step 5) and both are treated as a single
+captured from dev tools together (step 6) and both are treated as a single
 credential pair that expires and gets refreshed together — see "About
-auth expiring" below.
+auth expiring" below. When the cookie expires, the workflow logs back
+into tmwork on its own and refreshes it automatically — see the same
+section for exactly what that means and the risk tradeoffs involved.
 
 > **Heads up: the Gist is public-but-unlisted, not private.** GitHub
 > "secret" gists are unlisted (not searchable, not shown on your profile)
@@ -62,7 +64,26 @@ You'll need it as `GIST_ID`.
 6. Generate the token and save it somewhere — you'll paste it into a repo
    secret next (`GIST_TOKEN`) and won't be able to view it again.
 
-### 3. Install ntfy and pick an obscure topic
+### 3. Create a fine-grained GitHub PAT scoped to Actions secrets
+
+This one lets the workflow rewrite `TMWORK_COOKIE` on its own when tmwork's
+session expires. It's more powerful than the gist token (it can read/write
+*any* Actions secret in this repo), which is why it gets its own token
+instead of reusing `GIST_TOKEN` — see "About auth expiring" below for why
+that tradeoff exists at all before you create this.
+
+1. Go to **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens** ([direct link](https://github.com/settings/personal-access-tokens/new)).
+2. Name it `tmwork-sync-secrets-admin`, set an expiration.
+3. **Resource owner**: yourself.
+4. **Repository access**: **Only select repositories** → pick this repo
+   specifically. Do not leave it at "All repositories."
+5. Under **Repository permissions**, find **Secrets** and set it to
+   **Read and write**. Leave everything else at "No access."
+6. Generate the token and save it — you'll paste it into `SECRETS_ADMIN_TOKEN`
+   in step 5.
+
+### 4. Install ntfy and pick an obscure topic
 
 1. Install the [ntfy Android app](https://play.store) (also available on
    iOS, or use the web app at ntfy.sh) from the Play Store / App Store.
@@ -76,20 +97,28 @@ You'll need it as `GIST_ID`.
    ```
    You should see it land on your phone.
 
-### 4. Add the 5 secrets to the repo
+### 5. Add the 9 secrets to the repo
 
 In this repo: **Settings → Secrets and variables → Actions → New repository
 secret**. Add:
 
-| Secret name         | Value                                           |
-| -------------------- | ------------------------------------------------ |
-| `TMWORK_COOKIE`      | See step 5 below                                |
-| `TMWORK_API_TOKEN`   | See step 5 below                                |
-| `GIST_ID`            | The Gist ID from step 1                         |
-| `GIST_TOKEN`         | The fine-grained PAT from step 2                |
-| `NTFY_TOPIC`         | The topic name from step 3                      |
+| Secret name           | Value                                          |
+| ---------------------- | ------------------------------------------------ |
+| `TMWORK_COOKIE`        | See step 6 below                                |
+| `TMWORK_API_TOKEN`     | See step 6 below                                |
+| `TMWORK_CODE`          | The "Code" you normally use to sign in to tmwork |
+| `TMWORK_USER`          | Your tmwork username                            |
+| `TMWORK_PASSWORD`      | Your tmwork password                            |
+| `GIST_ID`              | The Gist ID from step 1                         |
+| `GIST_TOKEN`           | The fine-grained PAT from step 2                |
+| `SECRETS_ADMIN_TOKEN`  | The fine-grained PAT from step 3                |
+| `NTFY_TOPIC`           | The topic name from step 4                      |
 
-### 5. Get `TMWORK_COOKIE` and `TMWORK_API_TOKEN` from browser dev tools
+`TMWORK_CODE`/`TMWORK_USER`/`TMWORK_PASSWORD` are only ever used by the
+`refresh-auth` job to log back into tmwork when the session expires — the
+regular sync job never sees them.
+
+### 6. Get `TMWORK_COOKIE` and `TMWORK_API_TOKEN` from browser dev tools
 
 The `emplist` endpoint requires both a session cookie *and* an
 `X-Api-Token` request header — grab both from the same request:
@@ -107,21 +136,21 @@ The `emplist` endpoint requires both a session cookie *and* an
 
 Both represent your logged-in session, so treat them like passwords —
 they're already GitHub Actions secrets, which is the right place for
-them. Since they come from the same login and are sent together on every
-request, always refresh them **together** as a pair, even if only one of
-them turns out to be the one that actually expired.
+them. You'll only need to do this manually once at initial setup — after
+that, the workflow refreshes `TMWORK_COOKIE` on its own (see "About auth
+expiring" below).
 
-### 6. Trigger the workflow manually to verify it works
+### 7. Trigger the workflow manually to verify it works
 
 Go to **Actions → Sync tmwork schedule → Run workflow**. Watch the run:
 
 - If it succeeds, the Gist should now contain real ICS data — open the
   Gist and check the file content.
-- If it fails, check the logs. If it's an auth failure you should also get
-  an ntfy push telling you the cookie looks expired — confirm that arrived
-  too.
+- If it fails, check the logs. If it's an auth failure, a `refresh-auth`
+  job should kick off right after — check that it succeeds and that the
+  next `sync` run (or a manual re-run) picks up the new cookie.
 
-### 7. Subscribe from Outlook
+### 8. Subscribe from Outlook
 
 Use this URL format (raw Gist URL, filename included):
 
@@ -138,56 +167,78 @@ control, typically every few hours), which pairs fine with this repo's
 
 The tmwork session cookie **will** expire at some point — the exact
 interval isn't documented and may vary. **This is expected, not a bug.**
-When it happens, the scheduled run gets a 401/403 and you get an ntfy push
-telling you specifically that auth has expired (not a generic error). The
-`X-Api-Token` appears to be a static value rather than something tied to
-your session, so in practice it's usually only the cookie that needs
+The `X-Api-Token` appears to be a static value rather than something tied
+to your session, so in practice it's usually only the cookie that needs
 refreshing.
 
-### Fast path: `npm run refresh-auth`
+### It self-heals in CI
 
-One-time setup:
+When `sync` gets a 401/403, it exits with a specific code that triggers a
+second job, `refresh-auth` (see `.github/workflows/sync.yml`), which:
+
+1. Logs into tmwork.net directly over HTTP using the `TMWORK_CODE` /
+   `TMWORK_USER` / `TMWORK_PASSWORD` secrets (same request the login page
+   itself makes — no headless browser).
+2. Validates the resulting cookie against the emplist API.
+3. Pushes it to the `TMWORK_COOKIE` secret via `gh secret set`, authenticated
+   with `SECRETS_ADMIN_TOKEN`.
+
+The next scheduled `sync` run (within 4 hours) then picks up the fresh
+cookie automatically. There's no immediate retry built in — kept simple on
+purpose — so expect up to a ~4-hour gap in calendar updates around a
+refresh, not a hard failure. You still get an ntfy push for the original
+expiry, and a second one specifically if `refresh-auth` itself fails
+(wrong password, tmwork's login flow changed, `TMWORK_API_TOKEN` turned out
+not to be static after all, etc.) — that's your signal something needs a
+manual look.
+
+**Know what this trades away before you rely on it:** `SECRETS_ADMIN_TOKEN`
+can read/write every secret in this repo (there's no way to scope a PAT to
+a single secret name), and `TMWORK_PASSWORD` — your actual password, not a
+revocable session artifact — now sits in Actions secrets and flows through
+a job that runs `npm install` six times a day. A compromised dependency in
+that job could exfiltrate everything in one shot, and CI runner IPs are
+also more likely than your home network to get flagged by tmwork's own
+bot/rate-limit defenses. This repo has no access to anything beyond its own
+secrets, which caps the blast radius, but it's still a meaningfully bigger
+attack surface than a plain read-only sync. If that tradeoff stops being
+worth it, disable/delete the `refresh-auth` job and fall back to one of the
+options below.
+
+### Fallback: `npm run refresh-auth` (local)
+
+Same login flow, run from your own machine on demand instead of
+automatically in CI — keeps your password off GitHub entirely.
 
 ```bash
 cp .env.local.example .env.local
 ```
 
-Fill in `.env.local` with your tmwork `TMWORK_CODE` (the "Code" field on
-the sign-in page), `TMWORK_USER`, `TMWORK_PASSWORD`, and a copy of your
-current `TMWORK_API_TOKEN` secret. This file is gitignored and never
-committed — it stays on your machine, but treat it like a password vault
-since your tmwork password sits in it in plaintext.
-
-Whenever you get the ntfy "auth expired" alert:
+Fill in `.env.local` with `TMWORK_CODE`, `TMWORK_USER`, `TMWORK_PASSWORD`,
+and a copy of your current `TMWORK_API_TOKEN`. This file is gitignored and
+never committed — it stays on your machine, but treat it like a password
+vault since your tmwork password sits in it in plaintext. Then, whenever
+needed:
 
 ```bash
 npm run refresh-auth
 ```
 
-This logs into tmwork.net directly over HTTP with your stored credentials,
-grabs a fresh session cookie, validates it against the emplist API, and
-pushes it straight to the `TMWORK_COOKIE` GitHub secret via `gh secret
-set` (requires the [GitHub CLI](https://cli.github.com) installed and
-logged in locally — `gh auth login`). No browser, no dev tools, no
-GitHub Settings UI. `TMWORK_API_TOKEN` is left untouched.
+Requires the [GitHub CLI](https://cli.github.com) installed and logged in
+locally (`gh auth login`) with permission to write this repo's secrets.
 
-If a sync still fails right after a successful `refresh-auth` run, the api
-token has apparently changed after all — fall back to the manual path
-below for `TMWORK_API_TOKEN` specifically (and consider it not-so-static
-after all).
+### Fallback: manual, from dev tools
 
-### Manual fallback
-
-If `refresh-auth` isn't set up, or if `TMWORK_API_TOKEN` itself needs
+If neither of the above is set up, or `TMWORK_API_TOKEN` itself needs
 refreshing:
 
-1. Repeat step 5 above to grab a fresh cookie and/or API token from dev
+1. Repeat step 6 above to grab a fresh cookie and/or API token from dev
    tools.
 2. Update the relevant secret(s) in **Settings → Secrets and variables →
    Actions**.
 
-No code changes needed either way — the ntfy alert *is* the refresh
-signal.
+No code changes needed in any of these paths — the ntfy alert *is* the
+refresh signal, one way or another.
 
 ## Local development
 
@@ -198,14 +249,18 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_T
 
 ## How it works
 
-- `src/sync.ts` — the whole script. Fetches 3 overlapping `range=month`
+- `src/sync.ts` — the sync script. Fetches 3 overlapping `range=month`
   windows of shifts, dedupes by `Id`, builds an ICS file, PATCHes it to
-  the Gist, and notifies via ntfy on any failure.
-- `.github/workflows/sync.yml` — runs the script every 4 hours plus
-  on-demand via `workflow_dispatch`.
-- `scripts/refresh-auth.ts` — local-only re-auth helper (see "About auth
-  expiring" above). Never runs in CI; it needs your tmwork password from
-  `.env.local` and your locally-authenticated `gh` CLI to push the
-  refreshed cookie.
+  the Gist, and notifies via ntfy on any failure. Exits 2 specifically for
+  an expired-cookie failure, 1 for anything else.
+- `scripts/refresh-auth.ts` — the re-auth helper (see "About auth
+  expiring" above). Runs either locally (`npm run refresh-auth`, reading
+  `.env.local`) or as a CI job (reading repo secrets) — same code, same
+  login flow, different credential source and different `gh`-authenticated
+  identity pushing the result.
+- `.github/workflows/sync.yml` — two jobs: `sync` runs every 4 hours plus
+  on-demand via `workflow_dispatch`; `refresh-auth` runs only when `sync`
+  exits with code 2, and pushes a fresh `TMWORK_COOKIE` for the next
+  scheduled run to pick up.
 - Event times are written as floating local time (no `TZID`), matching the
   timestamps tmwork returns as-is.
