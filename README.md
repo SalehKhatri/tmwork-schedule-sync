@@ -4,11 +4,14 @@ Pulls your work schedule from TeamWork / ScheduleSource (tmwork.net) and
 publishes it as an ICS calendar feed you can subscribe to from Outlook (or
 any calendar app that supports "subscribe from URL").
 
-It runs on a schedule via GitHub Actions, fetches ~21 days of shifts
-(today, +7 days, +14 days, each a `range=week` call), dedupes them by `Id`,
-converts them to ICS events, and pushes the result to a GitHub Gist. If
-anything fails — most commonly expired auth — it sends you a push
-notification via [ntfy.sh](https://ntfy.sh) so you know to fix it.
+It runs on a schedule via GitHub Actions, fetches shifts (today, +7 days,
++14 days, each a `range=month` call), dedupes them by `Id`, converts them
+to ICS events, and pushes the result to a GitHub Gist. The three calls
+heavily overlap now that each pulls a full month, but that's harmless
+since results are deduped by `Id` — it just means comfortably more
+lookahead than the ~21 days the offsets alone would suggest. If anything
+fails — most commonly expired auth — it sends you a push notification via
+[ntfy.sh](https://ntfy.sh) so you know to fix it.
 
 tmwork's `emplist` endpoint requires two things from your logged-in
 browser session: a `Cookie` header and an `X-Api-Token` header. Both are
@@ -156,9 +159,9 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_T
 
 ## How it works
 
-- `src/sync.ts` — the whole script. Fetches 3 weeks of shifts, dedupes by
-  `Id`, builds an ICS file, PATCHes it to the Gist, and notifies via ntfy
-  on any failure.
+- `src/sync.ts` — the whole script. Fetches 3 overlapping `range=month`
+  windows of shifts, dedupes by `Id`, builds an ICS file, PATCHes it to
+  the Gist, and notifies via ntfy on any failure.
 - `.github/workflows/sync.yml` — runs the script every 4 hours plus
   on-demand via `workflow_dispatch`.
 - Event times are written as floating local time (no `TZID`), matching the

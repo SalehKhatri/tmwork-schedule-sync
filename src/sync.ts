@@ -40,8 +40,8 @@ function addDays(d: Date, days: number): Date {
   return new Date(d.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
-async function fetchShiftsForWeek(date1: string, cookie: string, apiToken: string): Promise<Shift[]> {
-  const url = `${TMWORK_BASE}?date1=${date1}&range=week`;
+async function fetchShifts(date1: string, cookie: string, apiToken: string): Promise<Shift[]> {
+  const url = `${TMWORK_BASE}?date1=${date1}&range=month`;
   const res = await fetch(url, {
     headers: { Cookie: cookie, "X-Api-Token": apiToken },
   });
@@ -156,11 +156,11 @@ async function main(): Promise<void> {
   const gistToken = requireEnv("GIST_TOKEN");
 
   const today = new Date();
-  const weekStarts = [0, 7, 14].map((offset) => formatDate(addDays(today, offset)));
+  const rangeStarts = [0, 7, 14].map((offset) => formatDate(addDays(today, offset)));
 
   const shiftsById = new Map<number, Shift>();
-  for (const date1 of weekStarts) {
-    const shifts = await fetchShiftsForWeek(date1, cookie, apiToken);
+  for (const date1 of rangeStarts) {
+    const shifts = await fetchShifts(date1, cookie, apiToken);
     for (const shift of shifts) {
       shiftsById.set(shift.Id, shift);
     }
