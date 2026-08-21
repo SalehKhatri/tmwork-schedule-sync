@@ -146,6 +146,21 @@ async function main(): Promise<void> {
 
   const newCookie = cookieHeader(jar);
 
+  // TEMP DIAGNOSTIC: the api token may not be static after all (login
+  // clearly succeeds -- see Location above -- but the old token still gets
+  // rejected). Fetch the post-login SPA shell and look for anything
+  // token-shaped embedded in it. Logs key names/lengths only, never values.
+  const dashRes = await fetch("https://www.tmwork.net/emp/", { headers: { Cookie: newCookie } });
+  const dashHtml = await dashRes.text();
+  console.log(`[diag] /emp/ fetch: HTTP ${dashRes.status}, body length ${dashHtml.length}`);
+  const tokenMatches = [...dashHtml.matchAll(/([a-zA-Z0-9_-]{0,24}[Tt]oken[a-zA-Z0-9_-]{0,24})["']?\s*[:=]\s*["']([^"']{8,100})["']/g)];
+  if (tokenMatches.length === 0) {
+    console.log("[diag] no token-shaped strings found in /emp/ body");
+  }
+  for (const m of tokenMatches.slice(0, 15)) {
+    console.log(`[diag] candidate key="${m[1]}" valueLength=${m[2].length} prefix="${m[2].slice(0, 6)}..."`);
+  }
+
   // Razor Pages login handlers can either redirect (302) or re-render the
   // form (200) on failure -- rather than guess which, treat the actual
   // emplist call as the source of truth for whether login worked.
