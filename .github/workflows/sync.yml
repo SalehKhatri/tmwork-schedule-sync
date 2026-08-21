@@ -1,0 +1,25 @@
+name: Sync tmwork schedule
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm install
+
+      - run: npx tsx src/sync.ts
+        env:
+          TMWORK_COOKIE: ${{ secrets.TMWORK_COOKIE }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
