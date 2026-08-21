@@ -138,6 +138,11 @@ async function main(): Promise<void> {
     }),
   });
   mergeCookies(jar, loginRes.headers.getSetCookie());
+  console.log(
+    `Login response: HTTP ${loginRes.status}, Location: ${loginRes.headers.get("location") ?? "(none)"}`,
+  );
+  // Names only -- never log cookie values, they're session credentials.
+  console.log(`Cookies held after login: ${[...jar.keys()].join(", ")}`);
 
   const newCookie = cookieHeader(jar);
 
