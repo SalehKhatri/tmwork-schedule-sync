@@ -20,6 +20,7 @@ jobs:
       - run: npx tsx src/sync.ts
         env:
           TMWORK_COOKIE: ${{ secrets.TMWORK_COOKIE }}
+          TMWORK_API_TOKEN: ${{ secrets.TMWORK_API_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}

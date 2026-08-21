@@ -7,8 +7,14 @@ any calendar app that supports "subscribe from URL").
 It runs on a schedule via GitHub Actions, fetches ~21 days of shifts
 (today, +7 days, +14 days, each a `range=week` call), dedupes them by `Id`,
 converts them to ICS events, and pushes the result to a GitHub Gist. If
-anything fails — most commonly an expired session cookie — it sends you a
-push notification via [ntfy.sh](https://ntfy.sh) so you know to fix it.
+anything fails — most commonly expired auth — it sends you a push
+notification via [ntfy.sh](https://ntfy.sh) so you know to fix it.
+
+tmwork's `emplist` endpoint requires two things from your logged-in
+browser session: a `Cookie` header and an `X-Api-Token` header. Both are
+captured from dev tools together (step 5) and both are treated as a single
+credential pair that expires and gets refreshed together — see "About
+auth expiring" below.
 
 > **Heads up: the Gist is public-but-unlisted, not private.** GitHub
 > "secret" gists are unlisted (not searchable, not shown on your profile)
@@ -67,32 +73,40 @@ You'll need it as `GIST_ID`.
    ```
    You should see it land on your phone.
 
-### 4. Add the 4 secrets to the repo
+### 4. Add the 5 secrets to the repo
 
 In this repo: **Settings → Secrets and variables → Actions → New repository
 secret**. Add:
 
-| Secret name     | Value                                              |
-| ---------------- | --------------------------------------------------- |
-| `TMWORK_COOKIE`  | See step 5 below                                   |
-| `GIST_ID`        | The Gist ID from step 1                            |
-| `GIST_TOKEN`     | The fine-grained PAT from step 2                   |
-| `NTFY_TOPIC`     | The topic name from step 3                         |
+| Secret name         | Value                                           |
+| -------------------- | ------------------------------------------------ |
+| `TMWORK_COOKIE`      | See step 5 below                                |
+| `TMWORK_API_TOKEN`   | See step 5 below                                |
+| `GIST_ID`            | The Gist ID from step 1                         |
+| `GIST_TOKEN`         | The fine-grained PAT from step 2                |
+| `NTFY_TOPIC`         | The topic name from step 3                      |
 
-### 5. Get `TMWORK_COOKIE` from browser dev tools
+### 5. Get `TMWORK_COOKIE` and `TMWORK_API_TOKEN` from browser dev tools
+
+The `emplist` endpoint requires both a session cookie *and* an
+`X-Api-Token` request header — grab both from the same request:
 
 1. Log in to tmwork.net normally in your browser and open your schedule.
 2. Open dev tools (F12 or Cmd+Option+I) → **Network** tab.
 3. Reload the page, or navigate to trigger a schedule fetch.
 4. Find the request to `emplist` (filter by "emplist" if needed).
-5. Click it → **Headers** → find the **Cookie** request header.
-6. Copy the *entire* value of that header (it'll be a long string of
-   `name=value; name2=value2; ...` pairs).
-7. Paste that whole string as the `TMWORK_COOKIE` secret value (step 4).
+5. Click it → **Headers** → scroll to **Request Headers**.
+6. Copy the *entire* value of the **Cookie** header (it'll be a long
+   string of `name=value; name2=value2; ...` pairs) → paste as
+   `TMWORK_COOKIE`.
+7. Copy the value of the **X-Api-Token** header → paste as
+   `TMWORK_API_TOKEN`.
 
-This cookie represents your logged-in session, so treat it like a
-password — it's already a GitHub Actions secret, which is the right place
-for it.
+Both represent your logged-in session, so treat them like passwords —
+they're already GitHub Actions secrets, which is the right place for
+them. Since they come from the same login and are sent together on every
+request, always refresh them **together** as a pair, even if only one of
+them turns out to be the one that actually expired.
 
 ### 6. Trigger the workflow manually to verify it works
 
@@ -117,17 +131,19 @@ polls subscribed calendars periodically (interval isn't fully under your
 control, typically every few hours), which pairs fine with this repo's
 4-hour sync schedule.
 
-## About the cookie expiring
+## About auth expiring
 
-The tmwork session cookie **will** expire at some point — the exact
-interval isn't documented and may vary. **This is expected, not a bug.**
-When it happens:
+The tmwork session cookie and `X-Api-Token` **will** expire at some
+point — the exact interval isn't documented and may vary, and it's not
+confirmed whether they expire on the same schedule as each other (they're
+minted from the same login, so most likely yes). **This is expected, not
+a bug.** When it happens:
 
 1. The scheduled run will get a 401/403 from tmwork.
-2. You'll get an ntfy push telling you specifically that the cookie has
-   expired (not a generic error).
-3. Repeat step 5 above to grab a fresh cookie and update the
-   `TMWORK_COOKIE` secret.
+2. You'll get an ntfy push telling you specifically that auth has expired
+   (not a generic error).
+3. Repeat step 5 above to grab a fresh cookie *and* fresh API token
+   together, and update both secrets.
 
 No code changes needed — the ntfy alert *is* the refresh signal.
 
@@ -135,7 +151,7 @@ No code changes needed — the ntfy alert *is* the refresh signal.
 
 ```bash
 npm install
-TMWORK_COOKIE="..." GIST_ID="..." GIST_TOKEN="..." NTFY_TOPIC="..." npx tsx src/sync.ts
+TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_TOPIC="..." npx tsx src/sync.ts
 ```
 
 ## How it works

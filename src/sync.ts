@@ -40,15 +40,15 @@ function addDays(d: Date, days: number): Date {
   return new Date(d.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
-async function fetchShiftsForWeek(date1: string, cookie: string): Promise<Shift[]> {
+async function fetchShiftsForWeek(date1: string, cookie: string, apiToken: string): Promise<Shift[]> {
   const url = `${TMWORK_BASE}?date1=${date1}&range=week`;
   const res = await fetch(url, {
-    headers: { Cookie: cookie },
+    headers: { Cookie: cookie, "X-Api-Token": apiToken },
   });
 
   if (res.status === 401 || res.status === 403) {
     throw new AuthExpiredError(
-      `tmwork rejected the session cookie (HTTP ${res.status}) — it has almost certainly expired`,
+      `tmwork rejected the session cookie/API token (HTTP ${res.status}) — they've almost certainly expired. Grab both fresh from dev tools together.`,
     );
   }
   if (!res.ok) {
@@ -151,6 +151,7 @@ async function notify(message: string): Promise<void> {
 
 async function main(): Promise<void> {
   const cookie = requireEnv("TMWORK_COOKIE");
+  const apiToken = requireEnv("TMWORK_API_TOKEN");
   const gistId = requireEnv("GIST_ID");
   const gistToken = requireEnv("GIST_TOKEN");
 
@@ -159,7 +160,7 @@ async function main(): Promise<void> {
 
   const shiftsById = new Map<number, Shift>();
   for (const date1 of weekStarts) {
-    const shifts = await fetchShiftsForWeek(date1, cookie);
+    const shifts = await fetchShiftsForWeek(date1, cookie, apiToken);
     for (const shift of shifts) {
       shiftsById.set(shift.Id, shift);
     }
