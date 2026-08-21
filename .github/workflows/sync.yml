@@ -1,6 +1,5 @@
 name: Sync tmwork schedule
 
-# Manual re-touch to force GitHub to index this workflow (see README/setup troubleshooting).
 on:
   schedule:
     - cron: "0 */4 * * *"
