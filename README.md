@@ -136,19 +136,58 @@ control, typically every few hours), which pairs fine with this repo's
 
 ## About auth expiring
 
-The tmwork session cookie and `X-Api-Token` **will** expire at some
-point — the exact interval isn't documented and may vary, and it's not
-confirmed whether they expire on the same schedule as each other (they're
-minted from the same login, so most likely yes). **This is expected, not
-a bug.** When it happens:
+The tmwork session cookie **will** expire at some point — the exact
+interval isn't documented and may vary. **This is expected, not a bug.**
+When it happens, the scheduled run gets a 401/403 and you get an ntfy push
+telling you specifically that auth has expired (not a generic error). The
+`X-Api-Token` appears to be a static value rather than something tied to
+your session, so in practice it's usually only the cookie that needs
+refreshing.
 
-1. The scheduled run will get a 401/403 from tmwork.
-2. You'll get an ntfy push telling you specifically that auth has expired
-   (not a generic error).
-3. Repeat step 5 above to grab a fresh cookie *and* fresh API token
-   together, and update both secrets.
+### Fast path: `npm run refresh-auth`
 
-No code changes needed — the ntfy alert *is* the refresh signal.
+One-time setup:
+
+```bash
+cp .env.local.example .env.local
+```
+
+Fill in `.env.local` with your tmwork `TMWORK_CODE` (the "Code" field on
+the sign-in page), `TMWORK_USER`, `TMWORK_PASSWORD`, and a copy of your
+current `TMWORK_API_TOKEN` secret. This file is gitignored and never
+committed — it stays on your machine, but treat it like a password vault
+since your tmwork password sits in it in plaintext.
+
+Whenever you get the ntfy "auth expired" alert:
+
+```bash
+npm run refresh-auth
+```
+
+This logs into tmwork.net directly over HTTP with your stored credentials,
+grabs a fresh session cookie, validates it against the emplist API, and
+pushes it straight to the `TMWORK_COOKIE` GitHub secret via `gh secret
+set` (requires the [GitHub CLI](https://cli.github.com) installed and
+logged in locally — `gh auth login`). No browser, no dev tools, no
+GitHub Settings UI. `TMWORK_API_TOKEN` is left untouched.
+
+If a sync still fails right after a successful `refresh-auth` run, the api
+token has apparently changed after all — fall back to the manual path
+below for `TMWORK_API_TOKEN` specifically (and consider it not-so-static
+after all).
+
+### Manual fallback
+
+If `refresh-auth` isn't set up, or if `TMWORK_API_TOKEN` itself needs
+refreshing:
+
+1. Repeat step 5 above to grab a fresh cookie and/or API token from dev
+   tools.
+2. Update the relevant secret(s) in **Settings → Secrets and variables →
+   Actions**.
+
+No code changes needed either way — the ntfy alert *is* the refresh
+signal.
 
 ## Local development
 
@@ -164,5 +203,9 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_T
   the Gist, and notifies via ntfy on any failure.
 - `.github/workflows/sync.yml` — runs the script every 4 hours plus
   on-demand via `workflow_dispatch`.
+- `scripts/refresh-auth.ts` — local-only re-auth helper (see "About auth
+  expiring" above). Never runs in CI; it needs your tmwork password from
+  `.env.local` and your locally-authenticated `gh` CLI to push the
+  refreshed cookie.
 - Event times are written as floating local time (no `TZID`), matching the
   timestamps tmwork returns as-is.

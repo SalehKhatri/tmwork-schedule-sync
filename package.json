@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Syncs a TeamWork/ScheduleSource (tmwork.net) work schedule into an ICS feed hosted on a GitHub Gist.",
   "scripts": {
-    "sync": "tsx src/sync.ts"
+    "sync": "tsx src/sync.ts",
+    "refresh-auth": "tsx scripts/refresh-auth.ts"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

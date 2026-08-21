@@ -1,0 +1,144 @@
+/**
+ * One-command re-auth: logs into tmwork.net with stored credentials, grabs a
+ * fresh session cookie, validates it against the emplist API, and pushes it
+ * straight to the GitHub Actions secret via `gh secret set`.
+ *
+ * Does NOT touch TMWORK_API_TOKEN. That value appears to be static (not tied
+ * to the session) rather than something that rotates on login, so it
+ * shouldn't need refreshing here. If a sync still fails right after a
+ * successful run of this script, the api token may have changed after all --
+ * grab a fresh one from dev tools once (see README) and update that secret
+ * by hand.
+ *
+ * Credentials come from .env.local (gitignored, never committed) -- see
+ * .env.local.example for the fields it needs.
+ *
+ * Run with: npm run refresh-auth
+ */
+
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function loadEnvLocal(): void {
+  const envPath = path.join(REPO_ROOT, ".env.local");
+  if (!existsSync(envPath)) return;
+  for (const line of readFileSync(envPath, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed
+      .slice(eq + 1)
+      .trim()
+      .replace(/^["']|["']$/g, "");
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing ${name} -- set it in .env.local (see .env.local.example)`);
+  }
+  return value;
+}
+
+/** Folds Set-Cookie response headers into a name -> value jar, overwriting on repeats. */
+function mergeCookies(jar: Map<string, string>, setCookieHeaders: string[]): void {
+  for (const raw of setCookieHeaders) {
+    const pair = raw.split(";")[0]; // drop attributes like Path=/, HttpOnly, Secure
+    const eq = pair.indexOf("=");
+    if (eq === -1) continue;
+    jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+}
+
+function cookieHeader(jar: Map<string, string>): string {
+  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+function getRepoSlug(): string {
+  const url = execFileSync("git", ["remote", "get-url", "origin"], { cwd: REPO_ROOT }).toString().trim();
+  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+?)(\.git)?$/);
+  if (!match) throw new Error(`Couldn't parse a GitHub repo slug from remote URL: ${url}`);
+  return `${match[1]}/${match[2]}`;
+}
+
+async function main(): Promise<void> {
+  loadEnvLocal();
+  const code = requireEnv("TMWORK_CODE");
+  const user = requireEnv("TMWORK_USER");
+  const password = requireEnv("TMWORK_PASSWORD");
+  const apiToken = requireEnv("TMWORK_API_TOKEN"); // only used here to validate the new cookie
+
+  const jar = new Map<string, string>();
+
+  console.log("Fetching sign-in page...");
+  const signInRes = await fetch("https://www.tmwork.net/signin-emp");
+  if (!signInRes.ok) {
+    throw new Error(`Failed to load the sign-in page: HTTP ${signInRes.status}`);
+  }
+  mergeCookies(jar, signInRes.headers.getSetCookie());
+
+  const html = await signInRes.text();
+  const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+  if (!tokenMatch) {
+    throw new Error(
+      "Couldn't find __RequestVerificationToken on the sign-in page -- tmwork may have changed its login form.",
+    );
+  }
+
+  console.log("Logging in...");
+  const loginRes = await fetch("https://www.tmwork.net/SignIn-Emp?handler=EmpLogin", {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Cookie: cookieHeader(jar),
+    },
+    body: new URLSearchParams({
+      portal: "emp",
+      EmpCode: code,
+      EmpUser: user,
+      EmpPassword: password,
+      __RequestVerificationToken: tokenMatch[1],
+    }),
+  });
+  mergeCookies(jar, loginRes.headers.getSetCookie());
+
+  const newCookie = cookieHeader(jar);
+
+  // Razor Pages login handlers can either redirect (302) or re-render the
+  // form (200) on failure -- rather than guess which, treat the actual
+  // emplist call as the source of truth for whether login worked.
+  console.log("Validating the new cookie against the emplist API...");
+  const today = new Date().toISOString().slice(0, 10);
+  const checkRes = await fetch(`https://www.tmwork.net/api/shift/emplist?date1=${today}&range=month`, {
+    headers: { Cookie: newCookie, "X-Api-Token": apiToken },
+  });
+  if (!checkRes.ok) {
+    throw new Error(
+      `Login appears to have failed (sign-in returned HTTP ${loginRes.status}, emplist check returned HTTP ${checkRes.status}). ` +
+        "Double check TMWORK_CODE/TMWORK_USER/TMWORK_PASSWORD in .env.local. If those are right, TMWORK_API_TOKEN may have " +
+        "expired too -- grab a fresh one from dev tools (see README) and update that secret by hand.",
+    );
+  }
+
+  console.log("Pushing the fresh cookie to the TMWORK_COOKIE GitHub secret...");
+  const repo = getRepoSlug();
+  execFileSync("gh", ["secret", "set", "TMWORK_COOKIE", "--repo", repo, "--body", newCookie], {
+    stdio: "inherit",
+  });
+
+  console.log("Done. TMWORK_COOKIE refreshed and pushed. (TMWORK_API_TOKEN left untouched.)");
+}
+
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exit(1);
+});
