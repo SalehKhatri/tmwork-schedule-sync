@@ -1,18 +1,18 @@
 /**
  * One-command re-auth: logs into tmwork.net with stored credentials, grabs a
- * fresh session cookie, validates it against the emplist API, and pushes it
- * straight to the GitHub Actions secret via `gh secret set`.
+ * fresh session cookie AND a fresh api token, validates the pair against the
+ * emplist API, and pushes both straight to their GitHub Actions secrets via
+ * `gh secret set`.
  *
- * Does NOT touch TMWORK_API_TOKEN. That value appears to be static (not tied
- * to the session) rather than something that rotates on login, so it
- * shouldn't need refreshing here. If a sync still fails right after a
- * successful run of this script, the api token may have changed after all --
- * grab a fresh one from dev tools once (see README) and update that secret
- * by hand.
+ * Both are minted per login: the cookie comes from the login response's
+ * Set-Cookie headers, and the api token comes from a global `APP.Token = "...
+ * "` assignment embedded in the post-login /emp/ page (confirmed by testing
+ * -- an old api token paired with a freshly logged-in cookie gets a 401, so
+ * it's tied to the session, not a static value).
  *
  * Credentials come from either .env.local (local runs -- gitignored, never
  * committed, see .env.local.example) or repo secrets (CI runs). Pushing the
- * refreshed secret requires a `gh`-authenticated identity with permission to
+ * refreshed secrets requires a `gh`-authenticated identity with permission to
  * write Actions secrets on this repo: locally that's your own `gh auth
  * login` session; in CI it's the SECRETS_ADMIN_TOKEN secret passed in as
  * GH_TOKEN (see .github/workflows/sync.yml and README).
@@ -20,9 +20,9 @@
  * Local run: npm run refresh-auth
  * CI run: triggered automatically by the refresh-auth job in
  * .github/workflows/sync.yml when the sync job exits with code 2
- * (AuthExpiredError) -- see src/sync.ts. In CI, the fresh cookie is also
+ * (AuthExpiredError) -- see src/sync.ts. In CI, both fresh values are also
  * written to $GITHUB_ENV so the workflow's very next step (an immediate
- * retry of sync.ts) can use it without waiting for the GitHub secret we
+ * retry of sync.ts) can use them without waiting for the GitHub secrets we
  * just pushed to become visible to a new job.
  */
 
@@ -74,16 +74,18 @@ function cookieHeader(jar: Map<string, string>): string {
 }
 
 /**
- * Exposes the fresh cookie to later steps in the same CI job, via
- * $GITHUB_ENV, so an immediate retry of sync.ts doesn't have to wait for
- * the (now-stale) `secrets.TMWORK_COOKIE` to refresh on the next run.
- * No-op outside of GitHub Actions (e.g. local `npm run refresh-auth`).
+ * Exposes fresh values to later steps in the same CI job, via $GITHUB_ENV,
+ * so an immediate retry of sync.ts doesn't have to wait for the (now-stale)
+ * secrets to refresh on the next run. No-op outside of GitHub Actions (e.g.
+ * local `npm run refresh-auth`).
  */
-function exposeToCiJobEnv(cookie: string): void {
+function exposeToCiJobEnv(values: Record<string, string>): void {
   if (!process.env.GITHUB_ENV) return;
-  console.log("::add-mask::" + cookie); // keep it out of any later log output too
-  const delimiter = `TMWORK_COOKIE_${randomUUID()}`;
-  appendFileSync(process.env.GITHUB_ENV, `TMWORK_COOKIE<<${delimiter}\n${cookie}\n${delimiter}\n`);
+  for (const [name, value] of Object.entries(values)) {
+    console.log("::add-mask::" + value); // keep it out of any later log output too
+    const delimiter = `${name}_${randomUUID()}`;
+    appendFileSync(process.env.GITHUB_ENV, `${name}<<${delimiter}\n${value}\n${delimiter}\n`);
+  }
 }
 
 function getRepoSlug(): string {
@@ -102,7 +104,6 @@ async function main(): Promise<void> {
   const code = requireEnv("TMWORK_CODE");
   const user = requireEnv("TMWORK_USER");
   const password = requireEnv("TMWORK_PASSWORD");
-  const apiToken = requireEnv("TMWORK_API_TOKEN"); // only used here to validate the new cookie
 
   const jar = new Map<string, string>();
 
@@ -113,9 +114,9 @@ async function main(): Promise<void> {
   }
   mergeCookies(jar, signInRes.headers.getSetCookie());
 
-  const html = await signInRes.text();
-  const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
-  if (!tokenMatch) {
+  const signInHtml = await signInRes.text();
+  const verificationTokenMatch = signInHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+  if (!verificationTokenMatch) {
     throw new Error(
       "Couldn't find __RequestVerificationToken on the sign-in page -- tmwork may have changed its login form.",
     );
@@ -134,70 +135,54 @@ async function main(): Promise<void> {
       EmpCode: code,
       EmpUser: user,
       EmpPassword: password,
-      __RequestVerificationToken: tokenMatch[1],
+      __RequestVerificationToken: verificationTokenMatch[1],
     }),
   });
   mergeCookies(jar, loginRes.headers.getSetCookie());
-  console.log(
-    `Login response: HTTP ${loginRes.status}, Location: ${loginRes.headers.get("location") ?? "(none)"}`,
-  );
-  // Names only -- never log cookie values, they're session credentials.
-  console.log(`Cookies held after login: ${[...jar.keys()].join(", ")}`);
-
   const newCookie = cookieHeader(jar);
 
-  // TEMP DIAGNOSTIC: the api token may not be static after all (login
-  // clearly succeeds -- see Location above -- but the old token still gets
-  // rejected). Fetch the post-login SPA shell and look for anything
-  // token-shaped embedded in it. Logs key names/lengths only, never values.
+  // The api token isn't returned as a header or cookie -- it's embedded as
+  // `APP.Token = "...";` in the post-login /emp/ page's inline script, and
+  // some shared JS elsewhere attaches it as the X-Api-Token header on API
+  // calls. Fetch that page with our new cookie and pull it out directly.
+  console.log("Fetching /emp/ to extract the fresh api token...");
   const dashRes = await fetch("https://www.tmwork.net/emp/", { headers: { Cookie: newCookie } });
-  const dashHtml = await dashRes.text();
-  console.log(`[diag] /emp/ fetch: HTTP ${dashRes.status}, body length ${dashHtml.length}`);
-  const tokenMatches = [...dashHtml.matchAll(/([a-zA-Z0-9_-]{0,24}[Tt]oken[a-zA-Z0-9_-]{0,24})["']?\s*[:=]\s*["']([^"']{8,100})["']/g)];
-  if (tokenMatches.length === 0) {
-    console.log("[diag] no token-shaped strings found in /emp/ body");
-  }
-  for (const m of tokenMatches.slice(0, 15)) {
-    console.log(`[diag] candidate key="${m[1]}" valueLength=${m[2].length} prefix="${m[2].slice(0, 6)}..."`);
-    // Context before the match only -- shows the surrounding variable/key
-    // name and syntax without repeating the value itself.
-    const idx = m.index ?? 0;
-    console.log(`[diag]   context before: ...${dashHtml.slice(Math.max(0, idx - 70), idx)}`);
-  }
-  const apiTokenMentionIdx = dashHtml.search(/x-api-token/i);
-  if (apiTokenMentionIdx === -1) {
-    console.log('[diag] literal "X-Api-Token" string not found in /emp/ body');
-  } else {
-    console.log(
-      `[diag] "X-Api-Token" mentioned: ...${dashHtml.slice(Math.max(0, apiTokenMentionIdx - 80), apiTokenMentionIdx + 100)}...`,
+  if (!dashRes.ok) {
+    throw new Error(
+      `Login appears to have failed: sign-in returned HTTP ${loginRes.status}, but /emp/ returned HTTP ${dashRes.status}. ` +
+        "Double check TMWORK_CODE/TMWORK_USER/TMWORK_PASSWORD.",
     );
   }
+  const dashHtml = await dashRes.text();
+  const apiTokenMatch = dashHtml.match(/APP\.Token\s*=\s*["']([^"']+)["']/);
+  if (!apiTokenMatch) {
+    throw new Error(
+      "Logged in, but couldn't find APP.Token on the /emp/ page -- tmwork may have changed where the api token lives.",
+    );
+  }
+  const newApiToken = apiTokenMatch[1];
 
-  // Razor Pages login handlers can either redirect (302) or re-render the
-  // form (200) on failure -- rather than guess which, treat the actual
-  // emplist call as the source of truth for whether login worked.
-  console.log("Validating the new cookie against the emplist API...");
+  console.log("Validating the fresh cookie + api token against the emplist API...");
   const today = new Date().toISOString().slice(0, 10);
   const checkRes = await fetch(`https://www.tmwork.net/api/shift/emplist?date1=${today}&range=month`, {
-    headers: { Cookie: newCookie, "X-Api-Token": apiToken },
+    headers: { Cookie: newCookie, "X-Api-Token": newApiToken },
   });
   if (!checkRes.ok) {
-    throw new Error(
-      `Login appears to have failed (sign-in returned HTTP ${loginRes.status}, emplist check returned HTTP ${checkRes.status}). ` +
-        "Double check TMWORK_CODE/TMWORK_USER/TMWORK_PASSWORD in .env.local. If those are right, TMWORK_API_TOKEN may have " +
-        "expired too -- grab a fresh one from dev tools (see README) and update that secret by hand.",
-    );
+    throw new Error(`New cookie + api token still got HTTP ${checkRes.status} from emplist -- something else changed.`);
   }
 
-  exposeToCiJobEnv(newCookie);
+  exposeToCiJobEnv({ TMWORK_COOKIE: newCookie, TMWORK_API_TOKEN: newApiToken });
 
-  console.log("Pushing the fresh cookie to the TMWORK_COOKIE GitHub secret...");
+  console.log("Pushing fresh TMWORK_COOKIE and TMWORK_API_TOKEN secrets...");
   const repo = getRepoSlug();
   execFileSync("gh", ["secret", "set", "TMWORK_COOKIE", "--repo", repo, "--body", newCookie], {
     stdio: "inherit",
   });
+  execFileSync("gh", ["secret", "set", "TMWORK_API_TOKEN", "--repo", repo, "--body", newApiToken], {
+    stdio: "inherit",
+  });
 
-  console.log("Done. TMWORK_COOKIE refreshed and pushed. (TMWORK_API_TOKEN left untouched.)");
+  console.log("Done. TMWORK_COOKIE and TMWORK_API_TOKEN refreshed and pushed.");
 }
 
 main().catch((err: unknown) => {

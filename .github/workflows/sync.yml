@@ -42,10 +42,11 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
 
-  # Only runs when `sync` failed specifically due to an expired session
-  # cookie. Logs into tmwork directly, pushes a fresh TMWORK_COOKIE secret,
-  # then immediately retries the sync in this same job -- see README "About
-  # auth expiring" for why an immediate retry matters (and its tradeoffs).
+  # Only runs when `sync` failed specifically due to expired auth. Logs into
+  # tmwork directly, pushes fresh TMWORK_COOKIE and TMWORK_API_TOKEN secrets
+  # (both are minted per login, not static), then immediately retries the
+  # sync in this same job -- see README "About auth expiring" for why an
+  # immediate retry matters (and its tradeoffs).
   refresh-auth:
     needs: sync
     if: always() && needs.sync.outputs.auth_expired == 'true'
@@ -59,24 +60,22 @@ jobs:
 
       - run: npm install
 
-      - name: Refresh tmwork session cookie
+      - name: Refresh tmwork session cookie and api token
         run: npx tsx scripts/refresh-auth.ts
         env:
           TMWORK_CODE: ${{ secrets.TMWORK_CODE }}
           TMWORK_USER: ${{ secrets.TMWORK_USER }}
           TMWORK_PASSWORD: ${{ secrets.TMWORK_PASSWORD }}
-          TMWORK_API_TOKEN: ${{ secrets.TMWORK_API_TOKEN }}
           GH_TOKEN: ${{ secrets.SECRETS_ADMIN_TOKEN }}
 
-      # TMWORK_COOKIE is deliberately not set here from `secrets.*` -- the
-      # secrets context is resolved once at job start, so it would still
-      # hold the stale value. The previous step already wrote the freshly
-      # validated cookie into this job's environment via $GITHUB_ENV, so it's
-      # already present here as a plain env var.
-      - name: Retry sync immediately with the fresh cookie
+      # TMWORK_COOKIE / TMWORK_API_TOKEN are deliberately not set here from
+      # `secrets.*` -- the secrets context is resolved once at job start, so
+      # it would still hold the stale values. The previous step already
+      # wrote the freshly validated pair into this job's environment via
+      # $GITHUB_ENV, so they're already present here as plain env vars.
+      - name: Retry sync immediately with the fresh credentials
         run: npx tsx src/sync.ts
         env:
-          TMWORK_API_TOKEN: ${{ secrets.TMWORK_API_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -84,7 +83,7 @@ jobs:
       - name: Notify if refresh or retry failed
         if: failure()
         run: |
-          curl -d "tmwork-schedule-sync: automated cookie refresh and/or the immediate retry failed. Check the Actions log -- TMWORK_API_TOKEN may have expired too, or tmwork's login flow may have changed. Manual fix needed." \
+          curl -d "tmwork-schedule-sync: automated auth refresh and/or the immediate retry failed. Check the Actions log -- tmwork's login flow may have changed. Manual fix needed." \
             "https://ntfy.sh/${NTFY_TOPIC}"
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
