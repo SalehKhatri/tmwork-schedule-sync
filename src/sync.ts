@@ -104,6 +104,13 @@ function buildIcs(shifts: Shift[]): string {
     "VERSION:2.0",
     "PRODID:-//tmwork-schedule-sync//EN",
     "CALSCALE:GREGORIAN",
+    // Hints to subscribed-calendar clients (Outlook, etc.) that they can
+    // poll this feed more often than their default interval. Not every
+    // client honors it, and those that do may still enforce their own
+    // floor, but it's a no-cost nudge toward fresher data without any
+    // manual re-subscribe.
+    "X-PUBLISHED-TTL:PT30M",
+    "REFRESH-INTERVAL;VALUE=DURATION:PT30M",
     ...events,
     "END:VCALENDAR",
   ].join("\r\n") + "\r\n";
