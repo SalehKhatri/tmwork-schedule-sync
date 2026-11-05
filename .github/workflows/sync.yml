@@ -91,4 +91,5 @@ jobs:
           TMWORK_PASSWORD: ${{ secrets.TMWORK_PASSWORD }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

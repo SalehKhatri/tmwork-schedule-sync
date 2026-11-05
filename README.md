@@ -10,8 +10,8 @@ to ICS events, and pushes the result to a GitHub Gist. The three calls
 heavily overlap now that each pulls a full month, but that's harmless
 since results are deduped by `Id` — it just means comfortably more
 lookahead than the ~21 days the offsets alone would suggest. If anything
-fails — most commonly expired auth — it sends you a push notification via
-[ntfy.sh](https://ntfy.sh) so you know to fix it.
+fails — or a station/time changes on an upcoming shift — it emails you
+from your own Gmail account (no third-party notification service).
 
 tmwork's `emplist` endpoint requires two things from your logged-in
 browser session: a `Cookie` header and an `X-Api-Token` header. Both are
@@ -83,21 +83,23 @@ that tradeoff exists at all before you create this.
 6. Generate the token and save it — you'll paste it into `SECRETS_ADMIN_TOKEN`
    in step 5.
 
-### 4. Install ntfy and pick an obscure topic
+### 4. Create a Gmail App Password for email alerts
 
-1. Install the [ntfy Android app](https://play.store) (also available on
-   iOS, or use the web app at ntfy.sh) from the Play Store / App Store.
-2. Pick a topic name that's hard to guess — ntfy topics are public by
-   topic name, so anyone who knows it can read/post to it. Something like
-   `khatri-tmwork-sync-x7q2p` works well. This is your `NTFY_TOPIC` value.
-3. In the app, subscribe to that exact topic name.
-4. Sanity check it works:
-   ```bash
-   curl -d "test notification" ntfy.sh/your-topic-name
-   ```
-   You should see it land on your phone.
+Alerts are sent from your Gmail to yourself over Gmail's SMTP server.
 
-### 5. Add the 9 secrets to the repo
+1. Turn on 2-Step Verification for your Google account (required for app
+   passwords).
+2. Go to <https://myaccount.google.com/apppasswords>, create one named
+   `tmwork-schedule-sync`, and copy the 16-character password. This is
+   your `GMAIL_APP_PASSWORD` (spaces are fine — they're stripped). It can
+   only send/read mail, not change your account, and you can revoke it
+   any time from the same page.
+3. Your Gmail address is `GMAIL_USER`. Alerts go to that same address
+   unless you set an optional `ALERT_EMAIL_TO` env var.
+4. On your phone, make sure Gmail notifications are on. Station-change
+   alerts are sent as high-importance.
+
+### 5. Add the secrets to the repo
 
 In this repo: **Settings → Secrets and variables → Actions → New repository
 secret**. Add:
@@ -112,7 +114,8 @@ secret**. Add:
 | `GIST_ID`              | The Gist ID from step 1                         |
 | `GIST_TOKEN`           | The fine-grained PAT from step 2                |
 | `SECRETS_ADMIN_TOKEN`  | The fine-grained PAT from step 3                |
-| `NTFY_TOPIC`           | The topic name from step 4                      |
+| `GMAIL_USER`           | Your Gmail address (step 4)                     |
+| `GMAIL_APP_PASSWORD`   | The Gmail App Password from step 4              |
 
 `TMWORK_CODE`/`TMWORK_USER`/`TMWORK_PASSWORD` are used to log in fresh on
 every run. `TMWORK_COOKIE`, `TMWORK_API_TOKEN` and `SECRETS_ADMIN_TOKEN`
@@ -146,7 +149,7 @@ Go to **Actions → Sync tmwork schedule → Run workflow**. Watch the run:
 
 - If it succeeds, the Gist should now contain real ICS data — open the
   Gist and check the file content.
-- If it fails, check the logs and the ntfy alert. "Sign In failed" means
+- If it fails, check the logs and the alert email. "Sign In failed" means
   the `TMWORK_*` login secrets are wrong.
 
 ### 8. Subscribe from Outlook
@@ -183,7 +186,7 @@ fetch. Nothing can go stale between runs, so there's no refresh job, no
 retry, and no PAT with write access to repo secrets.
 
 If login fails (wrong/changed password, tmwork changed its login flow) the
-run fails with exit code 2 and you get an ntfy push. A rejected password
+run fails with exit code 2 and you get an alert email. A rejected password
 is reported explicitly as "Sign In failed".
 
 `TMWORK_COOKIE` / `TMWORK_API_TOKEN` are only used as a fallback when the
@@ -225,27 +228,34 @@ to break `refresh-auth`:
 1. Repeat step 6 above to grab a fresh cookie and API token from dev tools.
 2. Update both secrets in **Settings → Secrets and variables → Actions**.
 
-No code changes needed in any of these paths — the ntfy alert *is* the
+No code changes needed in any of these paths — the alert email *is* the
 refresh signal, one way or another.
 
 ## Local development
 
 ```bash
 npm install
-TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_TOPIC="..." npx tsx src/sync.ts
+TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." GMAIL_USER="..." GMAIL_APP_PASSWORD="..." npx tsx src/sync.ts
 ```
 
 ## How it works
 
 - `src/sync.ts` — the sync script. Fetches 3 overlapping `range=month`
   windows of shifts, dedupes by `Id`, builds an ICS file, PATCHes it to
-  the Gist, and notifies via ntfy on any failure. Exits 2 specifically for
+  the Gist, and emails you on any failure. Exits 2 specifically for
   an expired-cookie failure, 1 for anything else.
 - `scripts/refresh-auth.ts` — the re-auth helper (see "About auth
   expiring" above). Runs either locally (`npm run refresh-auth`, reading
   `.env.local`) or as a CI job (reading repo secrets) — same code, same
   login flow, different credential source and different `gh`-authenticated
   identity pushing the result.
+- Change alerts — after each sync, `sync.ts` diffs the new shifts against
+  the previously published feed and emails you about upcoming shifts:
+  **"⚠️ Station changed: <day> → <new station>"** (high importance), and
+  **"📅 Schedule updated"** for new, removed or re-timed shifts. Your phone
+  gets it right away, even before your calendar app re-polls the feed.
+  Shift details only go in the email, never in the (public) Actions logs.
+- `src/lib/email.ts` — tiny dependency-free SMTP client (Gmail, port 465).
 - `.github/workflows/sync.yml` — a single job. A daily cron does a full sync
   (shifts are released ~2 weeks ahead); an hourly cron runs a ~3s check
   against the published feed and only syncs when a shift starts within the
