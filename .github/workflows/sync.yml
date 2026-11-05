@@ -1,89 +1,94 @@
 name: Sync tmwork schedule
 
+# Shifts are published ~2 weeks ahead, but the station can change up to ~1h
+# before a shift. So:
+#   - DAILY: one full sync a day picks up newly released shifts.
+#   - HOURLY: a ~3s check reads the already-published feed and only does a
+#     real sync if a shift starts within the next PRE_SHIFT_HOURS. Several
+#     chances per shift, because GitHub's scheduled runs are often delayed
+#     by an hour or more (and occasionally dropped).
+# Odd minutes on purpose: crons at :00 get delayed/dropped the most.
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "17 11 * * *" # DAILY  -- 6:17am EST / 7:17am EDT
+    - cron: "43 * * * *" # HOURLY -- pre-shift check
   workflow_dispatch: {}
 
+# Don't let a manual run and a scheduled run overlap.
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DAILY_CRON: "17 11 * * *" # must match the DAILY cron above exactly
+  PRE_SHIFT_HOURS: "6"
+  SHIFT_TZ: America/New_York # tmwork shift times are local (floating) time
+
 jobs:
+  # Single job: sync.ts logs into tmwork fresh on every run (session cookie +
+  # api token are minted per login and expire quickly), so there's no stored
+  # session to go stale and no separate refresh-auth job.
   sync:
     runs-on: ubuntu-latest
-    outputs:
-      auth_expired: ${{ steps.run_sync.outputs.auth_expired }}
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - run: npm install
-
-      - name: Run sync
-        id: run_sync
-        run: |
-          set +e
-          npx tsx src/sync.ts
-          code=$?
-          set -e
-          # Exit code 2 == AuthExpiredError (see src/sync.ts) -- signal that
-          # specifically to the refresh-auth job below, distinct from any
-          # other kind of failure.
-          if [ "$code" -eq 2 ]; then
-            echo "auth_expired=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "auth_expired=false" >> "$GITHUB_OUTPUT"
-          fi
-          exit "$code"
+      - name: Decide whether to sync
+        id: gate
         env:
-          TMWORK_COOKIE: ${{ secrets.TMWORK_COOKIE }}
-          TMWORK_API_TOKEN: ${{ secrets.TMWORK_API_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "$EVENT" != "schedule" ] || [ "$CRON" = "$DAILY_CRON" ]; then
+            echo "Full sync ($EVENT${CRON:+, cron '$CRON'})"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
 
-  # Only runs when `sync` failed specifically due to expired auth. Logs into
-  # tmwork directly, pushes fresh TMWORK_COOKIE and TMWORK_API_TOKEN secrets
-  # (both are minted per login, not static), then immediately retries the
-  # sync in this same job -- see README "About auth expiring" for why an
-  # immediate retry matters (and its tradeoffs).
-  refresh-auth:
-    needs: sync
-    if: always() && needs.sync.outputs.auth_expired == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          # Hourly check: is a shift starting within the next PRE_SHIFT_HOURS?
+          # Fail open -- if the feed can't be read, just sync.
+          if ! ics=$(curl -fsS -H "Authorization: Bearer $GIST_TOKEN" \
+                "https://api.github.com/gists/$GIST_ID" \
+              | jq -r '.files["job1-schedule.ics"].content // empty') || [ -z "$ics" ]; then
+            echo "Couldn't read the published feed; syncing anyway"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
 
-      - uses: actions/setup-node@v4
+          now=$(TZ="$SHIFT_TZ" date +%Y%m%dT%H%M%S)
+          until=$(TZ="$SHIFT_TZ" date -d "+$PRE_SHIFT_HOURS hours" +%Y%m%dT%H%M%S)
+          next=$(printf '%s\n' "$ics" | tr -d '\r' | sed -n 's/^DTSTART://p' \
+            | awk -v a="$now" -v b="$until" '$0 >= a && $0 <= b' | sort | head -1)
+
+          if [ -n "$next" ]; then
+            echo "Shift starting at $next (within ${PRE_SHIFT_HOURS}h) -- syncing for station changes"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No shift in the next ${PRE_SHIFT_HOURS}h -- nothing to do"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v5
+
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
+          cache: npm
 
-      - run: npm install
+      - if: steps.gate.outputs.run == 'true'
+        run: npm ci --no-audit --no-fund
 
-      - name: Refresh tmwork session cookie and api token
-        run: npx tsx scripts/refresh-auth.ts
+      - name: Run sync
+        if: steps.gate.outputs.run == 'true'
+        run: npx tsx src/sync.ts
         env:
           TMWORK_CODE: ${{ secrets.TMWORK_CODE }}
           TMWORK_USER: ${{ secrets.TMWORK_USER }}
           TMWORK_PASSWORD: ${{ secrets.TMWORK_PASSWORD }}
-          GH_TOKEN: ${{ secrets.SECRETS_ADMIN_TOKEN }}
-
-      # TMWORK_COOKIE / TMWORK_API_TOKEN are deliberately not set here from
-      # `secrets.*` -- the secrets context is resolved once at job start, so
-      # it would still hold the stale values. The previous step already
-      # wrote the freshly validated pair into this job's environment via
-      # $GITHUB_ENV, so they're already present here as plain env vars.
-      - name: Retry sync immediately with the fresh credentials
-        run: npx tsx src/sync.ts
-        env:
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-
-      - name: Notify if refresh or retry failed
-        if: failure()
-        run: |
-          curl -d "tmwork-schedule-sync: automated auth refresh and/or the immediate retry failed. Check the Actions log -- tmwork's login flow may have changed. Manual fix needed." \
-            "https://ntfy.sh/${NTFY_TOPIC}"
-        env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
