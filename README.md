@@ -255,6 +255,12 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." GMAIL_
   **"📅 Schedule updated"** for new, removed or re-timed shifts. Your phone
   gets it right away, even before your calendar app re-polls the feed.
   Shift details only go in the email, never in the (public) Actions logs.
+- Pre-shift reminder — the first run within 90 minutes of a shift's start
+  emails **"⏰ Shift at <time> — <station>"** with the time, station,
+  location and notes, using freshly synced data. Sent once per shift:
+  already-reminded shifts are tracked in a small `reminders.json` file in
+  the same gist. Scheduled runs can be late, so it typically arrives
+  30–90 min before; change the window with `REMINDER_MINUTES`.
 - `src/lib/email.ts` — tiny dependency-free SMTP client (Gmail, port 465).
 - `.github/workflows/sync.yml` — a single job. A daily cron does a full sync
   (shifts are released ~2 weeks ahead); an hourly cron runs a ~3s check

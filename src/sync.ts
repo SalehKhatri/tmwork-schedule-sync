@@ -119,7 +119,8 @@ function buildIcs(shifts: Shift[]): string {
   ].join("\r\n") + "\r\n";
 }
 
-async function pushToGist(gistId: string, token: string, icsContent: string): Promise<void> {
+/** PATCHes only the given files; other files in the gist are left untouched. */
+async function pushToGist(gistId: string, token: string, files: Record<string, string>): Promise<void> {
   const res = await fetch(`https://api.github.com/gists/${gistId}`, {
     method: "PATCH",
     headers: {
@@ -129,9 +130,7 @@ async function pushToGist(gistId: string, token: string, icsContent: string): Pr
       "User-Agent": "tmwork-schedule-sync",
     },
     body: JSON.stringify({
-      files: {
-        [GIST_FILENAME]: { content: icsContent },
-      },
+      files: Object.fromEntries(Object.entries(files).map(([name, content]) => [name, { content }])),
     }),
   });
 
@@ -173,7 +172,8 @@ function stripVolatile(ics: string): string {
   return ics.replace(/\r\n/g, "\n").replace(/^DTSTAMP:.*\n/gm, "");
 }
 
-async function fetchCurrentGistFile(gistId: string, token: string): Promise<string | null> {
+/** All files in the gist (name -> content), or null if it can't be read. */
+async function fetchGistFiles(gistId: string, token: string): Promise<Record<string, string> | null> {
   try {
     const res = await fetch(`https://api.github.com/gists/${gistId}`, {
       headers: {
@@ -184,9 +184,11 @@ async function fetchCurrentGistFile(gistId: string, token: string): Promise<stri
     });
     if (!res.ok) return null;
     const gist = (await res.json()) as { files?: Record<string, { content?: string; truncated?: boolean }> };
-    const file = gist.files?.[GIST_FILENAME];
-    if (!file || file.truncated) return null;
-    return file.content ?? null;
+    const out: Record<string, string> = {};
+    for (const [name, file] of Object.entries(gist.files ?? {})) {
+      if (!file.truncated && typeof file.content === "string") out[name] = file.content;
+    }
+    return out;
   } catch {
     return null; // can't compare -> just push
   }
@@ -310,6 +312,80 @@ async function notifyChanges(previousIcs: string, newIcs: string): Promise<void>
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pre-shift reminder: one email per shift, sent by the first run that lands
+// within REMINDER_MINUTES of the start (scheduled runs can be late, so this
+// is a window, not an exact time). Which shifts were already reminded is
+// kept in a small JSON file in the same gist, so there's no extra service.
+// ---------------------------------------------------------------------------
+
+const STATE_FILENAME = "reminders.json";
+const REMINDER_MINUTES = Number(process.env.REMINDER_MINUTES || 90);
+
+/** Wall-clock ICS local time -> minutes since epoch, treating it as UTC.
+ * Only ever used for differences between two times in the same zone. */
+function icsToMinutes(icsLocal: string): number {
+  const m = icsLocal.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/);
+  if (!m) return NaN;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) / 60000;
+}
+
+async function sendReminders(
+  shifts: Shift[],
+  stateJson: string | undefined,
+  gistId: string,
+  gistToken: string,
+): Promise<void> {
+  // key "<id>@<start>" -> so a re-timed shift gets a fresh reminder
+  let reminded: Record<string, string> = {};
+  try {
+    if (stateJson) reminded = JSON.parse(stateJson);
+  } catch {
+    reminded = {};
+  }
+
+  const now = nowInShiftTz();
+  const nowMin = icsToMinutes(now);
+  let changed = false;
+
+  for (const shift of shifts) {
+    const start = toIcsDateTime(shift.Start);
+    const minsUntil = icsToMinutes(start) - nowMin;
+    const key = `${shift.Id}@${start}`;
+    if (!(minsUntil > 0 && minsUntil <= REMINDER_MINUTES) || reminded[key]) continue;
+
+    const when = `${prettyTime(start)}–${prettyEnd(toIcsDateTime(shift.End))}`;
+    const startClock = prettyEnd(start);
+    const body = [
+      `Your shift starts in ${Math.round(minsUntil)} min.`,
+      "",
+      `When:     ${when}`,
+      `Station:  ${shift.StnName}`,
+      `Location: ${shift.LocName}`,
+      `Shift:    ${shift.Title}`,
+      `Approved: ${shift.IsApproved ? "yes" : "no"}`,
+      ...(shift.Notes ? [`Notes:    ${shift.Notes}`] : []),
+    ].join("\n");
+
+    console.log(`Sending pre-shift reminder (${Math.round(minsUntil)} min before start)`);
+    await notify(`⏰ Shift at ${startClock} — ${shift.StnName}`, body);
+    reminded[key] = now;
+    changed = true;
+  }
+
+  // Forget reminders older than ~2 days so the file stays tiny.
+  for (const [key, at] of Object.entries(reminded)) {
+    if (nowMin - icsToMinutes(at) > 2 * 24 * 60) {
+      delete reminded[key];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await pushToGist(gistId, gistToken, { [STATE_FILENAME]: JSON.stringify(reminded, null, 2) + "\n" });
+  }
+}
+
 /**
  * Logs in fresh every run (cookie + api token are minted per login and expire
  * quickly), so there's no stored session to go stale and no separate
@@ -347,20 +423,26 @@ async function main(): Promise<void> {
   const allShifts = [...shiftsById.values()].sort((a, b) => a.Start.localeCompare(b.Start));
   const ics = buildIcs(allShifts);
 
-  const current = await fetchCurrentGistFile(gistId, gistToken);
+  const gistFiles = await fetchGistFiles(gistId, gistToken);
+  const current = gistFiles?.[GIST_FILENAME] ?? null;
+
   if (current !== null && stripVolatile(current) === stripVolatile(ics)) {
     console.log(`No changes (${allShifts.length} shifts); gist left as-is`);
-    return;
+  } else {
+    await pushToGist(gistId, gistToken, { [GIST_FILENAME]: ics });
+    console.log(`Synced ${allShifts.length} shifts to gist ${gistId}`);
+
+    // Only diff when we know what was published before -- otherwise every
+    // shift would look "new". Best-effort: never fails the run.
+    if (current !== null) {
+      await notifyChanges(current, ics).catch((err) => console.error("Change notification failed:", err));
+    }
   }
 
-  await pushToGist(gistId, gistToken, ics);
-  console.log(`Synced ${allShifts.length} shifts to gist ${gistId}`);
-
-  // Only diff when we know what was published before -- otherwise every
-  // shift would look "new". Best-effort: never fails the run.
-  if (current !== null) {
-    await notifyChanges(current, ics).catch((err) => console.error("Change notification failed:", err));
-  }
+  // Best-effort as well: a reminder problem never fails the sync.
+  await sendReminders(allShifts, gistFiles?.[STATE_FILENAME], gistId, gistToken).catch((err) =>
+    console.error("Reminder failed:", err instanceof Error ? err.message : err),
+  );
 }
 
 main().catch(async (err: unknown) => {
