@@ -114,9 +114,9 @@ secret**. Add:
 | `SECRETS_ADMIN_TOKEN`  | The fine-grained PAT from step 3                |
 | `NTFY_TOPIC`           | The topic name from step 4                      |
 
-`TMWORK_CODE`/`TMWORK_USER`/`TMWORK_PASSWORD` are only ever used by the
-`refresh-auth` job to log back into tmwork when the session expires — the
-regular sync job never sees them.
+`TMWORK_CODE`/`TMWORK_USER`/`TMWORK_PASSWORD` are used to log in fresh on
+every run. `TMWORK_COOKIE`, `TMWORK_API_TOKEN` and `SECRETS_ADMIN_TOKEN`
+are only needed for the local/manual fallbacks below.
 
 ### 6. Get `TMWORK_COOKIE` and `TMWORK_API_TOKEN` from browser dev tools
 
@@ -146,9 +146,8 @@ Go to **Actions → Sync tmwork schedule → Run workflow**. Watch the run:
 
 - If it succeeds, the Gist should now contain real ICS data — open the
   Gist and check the file content.
-- If it fails, check the logs. If it's an auth failure, a `refresh-auth`
-  job should kick off right after — check that it succeeds and that the
-  next `sync` run (or a manual re-run) picks up the new cookie.
+- If it fails, check the logs and the ntfy alert. "Sign In failed" means
+  the `TMWORK_*` login secrets are wrong.
 
 ### 8. Subscribe from Outlook
 
@@ -160,8 +159,9 @@ https://gist.githubusercontent.com/{username}/{gist_id}/raw/job1-schedule.ics
 
 In Outlook: **Add calendar → Subscribe from web**, paste that URL. Outlook
 polls subscribed calendars periodically (interval isn't fully under your
-control, typically every few hours), which pairs fine with this repo's
-4-hour sync schedule.
+control, typically every few hours). The feed itself is refreshed once a
+day for newly released shifts, and roughly hourly in the 6 hours before
+each shift to pick up last-minute station changes.
 
 ## About auth expiring
 
@@ -174,42 +174,27 @@ like the cookie.)
 
 ### It self-heals in CI
 
-When `sync` gets a 401/403, it exits with a specific code that triggers a
-second job, `refresh-auth` (see `.github/workflows/sync.yml`), which:
+`sync.ts` doesn't rely on a stored session at all: every run logs into
+tmwork.net directly over HTTP with the `TMWORK_CODE` / `TMWORK_USER` /
+`TMWORK_PASSWORD` secrets (same request the login page makes — no headless
+browser), extracts the fresh api token from the `APP.Token = "..."`
+assignment on the post-login `/emp/` page, and uses that pair for the
+fetch. Nothing can go stale between runs, so there's no refresh job, no
+retry, and no PAT with write access to repo secrets.
 
-1. Logs into tmwork.net directly over HTTP using the `TMWORK_CODE` /
-   `TMWORK_USER` / `TMWORK_PASSWORD` secrets (same request the login page
-   itself makes — no headless browser).
-2. Extracts the fresh api token from a global `APP.Token = "..."`
-   assignment embedded in the post-login `/emp/` page.
-3. Validates the new cookie + api token pair against the emplist API.
-4. Pushes both to the `TMWORK_COOKIE` and `TMWORK_API_TOKEN` secrets via
-   `gh secret set`, authenticated with `SECRETS_ADMIN_TOKEN`.
-5. Immediately retries `sync` in the same job run, using the fresh values
-   directly (not by re-reading the secrets — GitHub resolves `secrets.*`
-   once at job start, so just-updated secrets wouldn't be visible yet to a
-   later step in that same job anyway). This closes the gap that would
-   otherwise leave the Gist stale for up to 4 hours waiting on the next
-   scheduled run — if refresh succeeds, the calendar is caught up within
-   the same run, not the next cron tick.
+If login fails (wrong/changed password, tmwork changed its login flow) the
+run fails with exit code 2 and you get an ntfy push. A rejected password
+is reported explicitly as "Sign In failed".
 
-You still get an ntfy push for the original expiry, and a second one
-specifically if the refresh and/or the retry fails (wrong password,
-tmwork's login flow changed, etc.) — that's your signal something needs a
-manual look.
+`TMWORK_COOKIE` / `TMWORK_API_TOKEN` are only used as a fallback when the
+login secrets aren't set, and `SECRETS_ADMIN_TOKEN` is no longer used by
+CI — you can delete all three secrets.
 
-**Know what this trades away before you rely on it:** `SECRETS_ADMIN_TOKEN`
-can read/write every secret in this repo (there's no way to scope a PAT to
-a single secret name), and `TMWORK_PASSWORD` — your actual password, not a
-revocable session artifact — now sits in Actions secrets and flows through
-a job that runs `npm install` six times a day. A compromised dependency in
-that job could exfiltrate everything in one shot, and CI runner IPs are
-also more likely than your home network to get flagged by tmwork's own
-bot/rate-limit defenses. This repo has no access to anything beyond its own
-secrets, which caps the blast radius, but it's still a meaningfully bigger
-attack surface than a plain read-only sync. If that tradeoff stops being
-worth it, disable/delete the `refresh-auth` job and fall back to one of the
-options below.
+**Tradeoff:** `TMWORK_PASSWORD` — your actual password, not a revocable
+session artifact — sits in Actions secrets and flows through a job that
+runs `npm ci`. A compromised dependency could exfiltrate it. If that stops
+being worth it, remove the login secrets and fall back to the options
+below.
 
 ### Fallback: `npm run refresh-auth` (local)
 
@@ -261,10 +246,11 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." NTFY_T
   `.env.local`) or as a CI job (reading repo secrets) — same code, same
   login flow, different credential source and different `gh`-authenticated
   identity pushing the result.
-- `.github/workflows/sync.yml` — two jobs: `sync` runs every 4 hours plus
-  on-demand via `workflow_dispatch`; `refresh-auth` runs only when `sync`
-  exits with code 2, pushes a fresh `TMWORK_COOKIE`, and immediately
-  retries `sync` in the same job so the Gist doesn't sit stale until the
-  next scheduled run.
+- `.github/workflows/sync.yml` — a single job. A daily cron does a full sync
+  (shifts are released ~2 weeks ahead); an hourly cron runs a ~3s check
+  against the published feed and only syncs when a shift starts within the
+  next 6 hours (stations can change up to ~1h before a shift). Also runs
+  on demand via `workflow_dispatch`. `sync.ts` logs in fresh each run, so
+  there's no separate refresh job.
 - Event times are written as floating local time (no `TZID`), matching the
   timestamps tmwork returns as-is.

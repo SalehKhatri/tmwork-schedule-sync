@@ -6,6 +6,8 @@
  * See README.md for one-time setup (Gist, PAT, ntfy topic, secrets).
  */
 
+import { login } from "./lib/tmwork-login.js";
+
 const TMWORK_BASE = "https://www.tmwork.net/api/shift/emplist";
 const GIST_FILENAME = "job1-schedule.ics";
 
@@ -156,11 +158,54 @@ async function notify(message: string): Promise<void> {
   }
 }
 
+/** Same as buildIcs output but with the per-run DTSTAMP lines removed, so two
+ * feeds with identical shifts compare equal. */
+function stripVolatile(ics: string): string {
+  // Normalize line endings too, in case the gist round-trip changes CRLF.
+  return ics.replace(/\r\n/g, "\n").replace(/^DTSTAMP:.*\n/gm, "");
+}
+
+async function fetchCurrentGistFile(gistId: string, token: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "tmwork-schedule-sync",
+      },
+    });
+    if (!res.ok) return null;
+    const gist = (await res.json()) as { files?: Record<string, { content?: string; truncated?: boolean }> };
+    const file = gist.files?.[GIST_FILENAME];
+    if (!file || file.truncated) return null;
+    return file.content ?? null;
+  } catch {
+    return null; // can't compare -> just push
+  }
+}
+
+/**
+ * Logs in fresh every run (cookie + api token are minted per login and expire
+ * quickly), so there's no stored session to go stale and no separate
+ * refresh-auth job. Falls back to TMWORK_COOKIE/TMWORK_API_TOKEN only when
+ * login credentials aren't configured.
+ */
+async function getSession(): Promise<{ cookie: string; apiToken: string }> {
+  const { TMWORK_CODE, TMWORK_USER, TMWORK_PASSWORD } = process.env;
+  if (TMWORK_CODE && TMWORK_USER && TMWORK_PASSWORD) {
+    try {
+      return await login(TMWORK_CODE, TMWORK_USER, TMWORK_PASSWORD);
+    } catch (err) {
+      throw new AuthExpiredError(err instanceof Error ? err.message : String(err));
+    }
+  }
+  return { cookie: requireEnv("TMWORK_COOKIE"), apiToken: requireEnv("TMWORK_API_TOKEN") };
+}
+
 async function main(): Promise<void> {
-  const cookie = requireEnv("TMWORK_COOKIE");
-  const apiToken = requireEnv("TMWORK_API_TOKEN");
   const gistId = requireEnv("GIST_ID");
   const gistToken = requireEnv("GIST_TOKEN");
+  const { cookie, apiToken } = await getSession();
 
   const today = new Date();
   const rangeStarts = [0, 7, 14].map((offset) => formatDate(addDays(today, offset)));
@@ -176,6 +221,12 @@ async function main(): Promise<void> {
   const allShifts = [...shiftsById.values()].sort((a, b) => a.Start.localeCompare(b.Start));
   const ics = buildIcs(allShifts);
 
+  const current = await fetchCurrentGistFile(gistId, gistToken);
+  if (current !== null && stripVolatile(current) === stripVolatile(ics)) {
+    console.log(`No changes (${allShifts.length} shifts); gist left as-is`);
+    return;
+  }
+
   await pushToGist(gistId, gistToken, ics);
   console.log(`Synced ${allShifts.length} shifts to gist ${gistId}`);
 }
@@ -184,13 +235,11 @@ main().catch(async (err: unknown) => {
   const isAuthError = err instanceof AuthExpiredError;
   const detail = err instanceof Error ? err.message : String(err);
   const message = isAuthError
-    ? `tmwork-schedule-sync: TMWORK_COOKIE has expired. Grab a fresh one from browser dev tools and update the repo secret. (${detail})`
+    ? `tmwork-schedule-sync: tmwork auth failed -- check the TMWORK_CODE/TMWORK_USER/TMWORK_PASSWORD secrets. (${detail})`
     : `tmwork-schedule-sync: sync failed. ${detail}`;
 
   console.error(message);
   await notify(message);
-  // Exit code 2 specifically means "auth expired" -- the refresh-auth job in
-  // the workflow checks for this exact code to decide whether to attempt an
-  // automated re-login. Any other failure exits 1 and is left alone.
+  // Exit code 2 = auth problem, 1 = anything else (kept distinct for logs).
   process.exit(isAuthError ? 2 : 1);
 });
