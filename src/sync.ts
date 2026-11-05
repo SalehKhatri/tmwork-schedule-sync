@@ -3,9 +3,10 @@
  * ICS calendar file, published to a GitHub Gist so it can be subscribed to
  * from Outlook (or any calendar app that supports "subscribe from URL").
  *
- * See README.md for one-time setup (Gist, PAT, ntfy topic, secrets).
+ * See README.md for one-time setup (Gist, PAT, Gmail app password, secrets).
  */
 
+import { sendEmail } from "./lib/email.js";
 import { login } from "./lib/tmwork-login.js";
 
 const TMWORK_BASE = "https://www.tmwork.net/api/shift/emplist";
@@ -140,21 +141,28 @@ async function pushToGist(gistId: string, token: string, icsContent: string): Pr
   }
 }
 
-/** Best-effort push notification. Never throws — a notification failure
- * should never mask (or cause) a run failure. */
-async function notify(message: string): Promise<void> {
+/** Best-effort email alert from your Gmail to yourself. Never throws -- a
+ * notification failure should never mask (or cause) a run failure. Never
+ * logs the message content either: this repo's Actions logs are public. */
+async function notify(subject: string, body: string, urgent = false): Promise<void> {
+  const user = process.env.GMAIL_USER;
+  const password = process.env.GMAIL_APP_PASSWORD;
+  if (!user || !password) {
+    console.error("GMAIL_USER / GMAIL_APP_PASSWORD not set; skipping email alert");
+    return;
+  }
   try {
-    const topic = process.env.NTFY_TOPIC;
-    if (!topic) {
-      console.error("NTFY_TOPIC not set; skipping notification");
-      return;
-    }
-    await fetch(`https://ntfy.sh/${topic}`, {
-      method: "POST",
-      body: message,
+    await sendEmail({
+      user,
+      password: password.replace(/\s+/g, ""), // Google shows app passwords with spaces
+      to: process.env.ALERT_EMAIL_TO || user,
+      subject,
+      body,
+      urgent,
     });
+    console.log("Email alert sent");
   } catch (err) {
-    console.error("Failed to send ntfy notification:", err);
+    console.error("Failed to send email alert:", err instanceof Error ? err.message : err);
   }
 }
 
@@ -181,6 +189,124 @@ async function fetchCurrentGistFile(gistId: string, token: string): Promise<stri
     return file.content ?? null;
   } catch {
     return null; // can't compare -> just push
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Change notifications: diff the previously published feed against the new
+// shifts and email an alert, so a last-minute station change reaches your
+// phone right away even if your calendar app hasn't re-polled the feed yet.
+// ---------------------------------------------------------------------------
+
+const SHIFT_TZ = process.env.SHIFT_TZ || "America/New_York";
+
+interface FeedEvent {
+  start: string; // ICS local form, e.g. 20261112T180000
+  end: string;
+  summary: string;
+  location: string;
+}
+
+function unescapeIcsText(s: string): string {
+  return s.replace(/\\n/gi, "\n").replace(/\\([,;\\])/g, "$1");
+}
+
+/** Parses the events this script itself wrote (one property per line, no folding). */
+function parseFeed(ics: string): Map<string, FeedEvent> {
+  const events = new Map<string, FeedEvent>();
+  for (const block of ics.replace(/\r\n/g, "\n").split("BEGIN:VEVENT").slice(1)) {
+    const prop = (name: string) => block.match(new RegExp(`^${name}:(.*)$`, "m"))?.[1] ?? "";
+    const uid = prop("UID");
+    if (!uid) continue;
+    events.set(uid, {
+      start: prop("DTSTART"),
+      end: prop("DTEND"),
+      summary: unescapeIcsText(prop("SUMMARY")),
+      location: unescapeIcsText(prop("LOCATION")),
+    });
+  }
+  return events;
+}
+
+/** "Now" in the shifts' local timezone, in ICS local form (20261105T143000). */
+function nowInShiftTz(): string {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: SHIFT_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date())
+      .map((p) => [p.type, p.value]),
+  );
+  return `${parts.year}${parts.month}${parts.day}T${parts.hour}${parts.minute}${parts.second}`;
+}
+
+/** 20261112T180000 -> "Thu Nov 12, 6:00 PM" (treated as wall-clock time). */
+function prettyTime(icsLocal: string): string {
+  const m = icsLocal.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/);
+  if (!m) return icsLocal;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+  return d.toLocaleString("en-US", {
+    timeZone: "UTC",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function prettyEnd(icsLocal: string): string {
+  return prettyTime(icsLocal).split(", ").pop() ?? icsLocal;
+}
+
+async function notifyChanges(previousIcs: string, newIcs: string): Promise<void> {
+  const before = parseFeed(previousIcs);
+  const after = parseFeed(newIcs);
+  const now = nowInShiftTz();
+
+  const stationChanges: string[] = [];
+  const otherChanges: string[] = [];
+
+  for (const [uid, ev] of after) {
+    if (ev.start < now) continue; // only care about upcoming shifts
+    const old = before.get(uid);
+    const when = `${prettyTime(ev.start)}–${prettyEnd(ev.end)}`;
+    if (!old) {
+      otherChanges.push(`New shift: ${when}\n${ev.location}`);
+      continue;
+    }
+    if (old.location !== ev.location) {
+      stationChanges.push(`${when}\n${old.location}\n→ ${ev.location}`);
+    }
+    if (old.start !== ev.start || old.end !== ev.end) {
+      otherChanges.push(
+        `Time changed: ${prettyTime(old.start)}–${prettyEnd(old.end)}\n→ ${when}\n${ev.location}`,
+      );
+    }
+  }
+  for (const [uid, old] of before) {
+    if (old.start >= now && !after.has(uid)) {
+      otherChanges.push(`Shift removed: ${prettyTime(old.start)}–${prettyEnd(old.end)}\n${old.location}`);
+    }
+  }
+
+  if (stationChanges.length) {
+    console.log(`Station changed for ${stationChanges.length} shift(s)`);
+    // Put the new station in the subject so the phone notification alone is enough.
+    const first = stationChanges[0].split("\n");
+    const subject = `⚠️ Station changed: ${first[0].split(",").slice(0, 2).join(",")} ${first[2]}`;
+    await notify(subject, stationChanges.join("\n\n"), true);
+  }
+  if (otherChanges.length) {
+    console.log(`${otherChanges.length} other schedule change(s)`);
+    await notify("📅 Schedule updated", otherChanges.join("\n\n"));
   }
 }
 
@@ -229,6 +355,12 @@ async function main(): Promise<void> {
 
   await pushToGist(gistId, gistToken, ics);
   console.log(`Synced ${allShifts.length} shifts to gist ${gistId}`);
+
+  // Only diff when we know what was published before -- otherwise every
+  // shift would look "new". Best-effort: never fails the run.
+  if (current !== null) {
+    await notifyChanges(current, ics).catch((err) => console.error("Change notification failed:", err));
+  }
 }
 
 main().catch(async (err: unknown) => {
@@ -239,7 +371,7 @@ main().catch(async (err: unknown) => {
     : `tmwork-schedule-sync: sync failed. ${detail}`;
 
   console.error(message);
-  await notify(message);
+  await notify(isAuthError ? "tmwork-schedule-sync: login failed" : "tmwork-schedule-sync: sync failed", message, isAuthError);
   // Exit code 2 = auth problem, 1 = anything else (kept distinct for logs).
   process.exit(isAuthError ? 2 : 1);
 });
