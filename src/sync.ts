@@ -80,6 +80,8 @@ function toIcsUtcStamp(date: Date): string {
   return date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
 }
 
+const ALARM_MINUTES_BEFORE = 60;
+
 function buildIcs(shifts: Shift[]): string {
   const now = toIcsUtcStamp(new Date());
 
@@ -98,6 +100,14 @@ function buildIcs(shifts: Shift[]): string {
       `SUMMARY:${escapeIcsText(shift.Title)}`,
       `LOCATION:${location}`,
       `DESCRIPTION:${description}`,
+      // Reminder fired by the calendar app itself -- reliable even when
+      // GitHub's scheduled runs are late or skipped (the email reminder is
+      // the backup that carries the freshest station info).
+      "BEGIN:VALARM",
+      "ACTION:DISPLAY",
+      `DESCRIPTION:${escapeIcsText(`${shift.Title} at ${shift.StnName}`)}`,
+      `TRIGGER:-PT${ALARM_MINUTES_BEFORE}M`,
+      "END:VALARM",
       "END:VEVENT",
     ].join("\r\n");
   });
