@@ -255,6 +255,10 @@ TMWORK_COOKIE="..." TMWORK_API_TOKEN="..." GIST_ID="..." GIST_TOKEN="..." GMAIL_
   **"📅 Schedule updated"** for new, removed or re-timed shifts. Your phone
   gets it right away, even before your calendar app re-polls the feed.
   Shift details only go in the email, never in the (public) Actions logs.
+- Calendar alarm — every event in the feed carries a 1-hour reminder
+  (`VALARM`), so your calendar app reminds you on time even when GitHub's
+  scheduled runs are late or skipped. iPhone/Google Calendar honor alarms
+  in subscribed calendars; Outlook may ignore them.
 - Pre-shift reminder — the first run within 90 minutes of a shift's start
   emails **"⏰ Shift at <time> — <station>"** with the time, station,
   location and notes, using freshly synced data. Sent once per shift:
